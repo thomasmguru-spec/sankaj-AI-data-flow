@@ -1,0 +1,2 @@
+[functions.update-order]
+verify_jwt = false
