@@ -1,9 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { unstable_noStore as noStore } from 'next/cache';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 
 export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+export const fetchCache = 'force-no-store';
 
 export async function GET(req: NextRequest) {
+  noStore();
   try {
     const supabase = createServiceRoleClient();
     const { searchParams } = req.nextUrl;
@@ -13,7 +17,7 @@ export async function GET(req: NextRequest) {
     // Fetch from pending_approvals table which stores WhatsApp orders
     const { data, count, error } = await supabase
       .from('pending_approvals')
-      .select('id, n8n_execution_id, whatsapp_sender, twilio_message_sid, status, analyzed_items, created_at, updated_at, media_url', { count: 'exact' })
+      .select('id, n8n_execution_id, whatsapp_sender, twilio_message_sid, status, type, analyzed_items, created_at, updated_at, media_url', { count: 'exact' })
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -37,7 +41,11 @@ export async function GET(req: NextRequest) {
         billing_address: null,
         shipping_address: null,
         payment_terms: null,
-        special_instructions: `Twilio SID: ${row.twilio_message_sid}`,
+        special_instructions: [
+          row.twilio_message_sid ? `Twilio SID: ${row.twilio_message_sid}` : null,
+          row.n8n_execution_id ? `n8n: ${row.n8n_execution_id}` : null,
+        ].filter(Boolean).join(' | ') || null,
+        order_type: row.type,
         subtotal: null,
         tax_amount: null,
         total_amount: null,
@@ -53,8 +61,8 @@ export async function GET(req: NextRequest) {
           original_filename: `WhatsApp order from ${row.whatsapp_sender}`,
           received_at: row.created_at,
           source_identifier: row.twilio_message_sid,
-          file_mime_type: 'text/plain',
-          media_url: row.media_url || null,
+          file_mime_type: row.type === 'text' ? 'text/plain' : 'image/jpeg',
+          media_url: row.type === 'image' ? (row.media_url || null) : null,
         },
 
         order_lines: items.map((it: any, i: number) => ({
@@ -72,7 +80,10 @@ export async function GET(req: NextRequest) {
     });
 
     // Return the records so the frontend can display them easily
-    return NextResponse.json({ data: mappedRows, total: count ?? 0 });
+    return NextResponse.json(
+      { data: mappedRows, total: count ?? 0 },
+      { headers: { 'Cache-Control': 'no-store' } }
+    );
   } catch (err) {
     console.error('New orders API error:', err);
     return NextResponse.json(
