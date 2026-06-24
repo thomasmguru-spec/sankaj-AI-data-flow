@@ -1,4 +1,5 @@
 import './globals.css';
+import { AppToaster } from '@/components/app-toaster';
 
 export const metadata = {
   title: 'AI Data Flow — Order Processing',
@@ -24,6 +25,7 @@ export default function RootLayout({
         <main className="mx-auto w-full max-w-screen-2xl px-4 sm:px-6 lg:px-10 py-8">
           {children}
         </main>
+        <AppToaster />
       </body>
     </html>
   );
