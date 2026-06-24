@@ -2,9 +2,12 @@
 
 import { Card, Badge } from '@/components/ui';
 import { formatCurrency, formatDate, getStatusColor } from '@/lib/utils';
-import { Package, RefreshCw, ChevronLeft, ChevronRight, MessageSquare, Mail, ScanLine, Cloud, Image, FileText, Phone } from 'lucide-react';
+import { Package, RefreshCw, ChevronLeft, ChevronRight, MessageSquare, Mail, ScanLine, Cloud, Image, FileText, Phone, X, Pencil } from 'lucide-react';
 import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
+import { toastWarningOptions } from '@/components/app-toaster';
+import { OrderEditModal, type EditableOrder } from '@/components/orders/OrderEditModal';
 
 interface WhatsAppItem {
   itemName: string;
@@ -70,6 +73,7 @@ interface NewOrder {
   exception_status: string | null;
   export_status: string | null;
   approval_status: string | null;
+  order_type?: 'image' | 'text' | null;
   created_at: string;
   document_id?: string | null;
   documents: {
@@ -81,6 +85,33 @@ interface NewOrder {
     media_url?: string | null;
   };
   order_lines: NewOrderLine[] | null;
+}
+
+function mapSavedRowToOrder(
+  order: NewOrder,
+  saved: {
+    whatsapp_sender: string;
+    analyzed_items: { item?: string; itemName?: string; description?: string; quantity?: number | null; uom?: string | null }[];
+  }
+): NewOrder {
+  const items = Array.isArray(saved.analyzed_items) ? saved.analyzed_items : [];
+  return {
+    ...order,
+    customer_whatsapp: saved.whatsapp_sender,
+    customer_phone: saved.whatsapp_sender,
+    customer_name: saved.whatsapp_sender,
+    order_lines: items.map((it, i) => ({
+      line_number: i + 1,
+      sku_name: it.item || it.description || it.itemName || null,
+      sku_code: null,
+      description: it.item || it.description || it.itemName || null,
+      quantity: it.quantity != null ? Number(it.quantity) : null,
+      unit_of_measure: it.uom || null,
+      unit_price: null,
+      line_total: null,
+      sku_matched: false,
+    })),
+  };
 }
 
 const SOURCE_ICONS: Record<string, typeof MessageSquare> = {
@@ -101,6 +132,7 @@ const SOURCE_LABELS: Record<string, string> = {
 
 
 export default function OrdersPage() {
+  const router = useRouter();
   const [newOrders, setNewOrders] = useState<NewOrder[]>([]);
   const [newOrdersTotal, setNewOrdersTotal] = useState(0);
   const [newOrdersSource, setNewOrdersSource] = useState('whatsapp');
@@ -110,6 +142,8 @@ export default function OrdersPage() {
   const [error, setError] = useState<string | null>(null);
   const [newOrdersPage, setNewOrdersPage] = useState(1);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+  const [editingOrder, setEditingOrder] = useState<EditableOrder | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
 
   const TABLE_PAGE_SIZE = 10;
   const paginatedNewOrders = newOrders.slice((newOrdersPage - 1) * TABLE_PAGE_SIZE, newOrdersPage * TABLE_PAGE_SIZE);
@@ -123,13 +157,18 @@ export default function OrdersPage() {
 
 
 
-  const fetchNewOrders = useCallback(async () => {
-    setLoading(true);
+  const fetchNewOrders = useCallback(async (options?: { silent?: boolean }): Promise<NewOrder[]> => {
+    if (!options?.silent) {
+      setLoading(true);
+    }
     setError(null);
     try {
-      const params = new URLSearchParams({ limit: '200' });
+      const params = new URLSearchParams({ limit: '200', _: String(Date.now()) });
       if (newOrdersSource) params.set('source', newOrdersSource);
-      const res = await fetch(`/api/orders/new?${params}`);
+      const res = await fetch(`/api/orders/new?${params}`, {
+        cache: 'no-store',
+        headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
+      });
       if (!res.ok) {
         const raw = await res.text();
         let msg = `HTTP ${res.status}`;
@@ -137,12 +176,17 @@ export default function OrdersPage() {
         throw new Error(msg);
       }
       const json = await res.json();
-      setNewOrders(json.data || []);
+      const rows: NewOrder[] = json.data || [];
+      setNewOrders(rows);
       setNewOrdersTotal(json.total || 0);
+      return rows;
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to fetch new orders');
+      return [];
     } finally {
-      setLoading(false);
+      if (!options?.silent) {
+        setLoading(false);
+      }
     }
   }, [newOrdersSource]);
 
@@ -327,19 +371,105 @@ export default function OrdersPage() {
 
 
   const updateApprovalStatus = useCallback(async (orderId: string, status: string) => {
+    const toastMessages: Record<string, { loading: string; success: string; error: string }> = {
+      approved: {
+        loading: 'Approving order…',
+        success: 'Order approved successfully',
+        error: 'Failed to approve order',
+      },
+      rejected: {
+        loading: 'Rejecting order…',
+        success: 'Order rejected successfully',
+        error: 'Failed to reject order',
+      },
+      pending: {
+        loading: 'Updating order status…',
+        success: 'Order set back to pending',
+        error: 'Failed to update order status',
+      },
+    };
+    const messages = toastMessages[status] ?? toastMessages.pending;
+    const toastId = toast.loading(messages.loading);
+
     try {
       const res = await fetch('/api/orders/update-status', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: orderId, status }),
+        body: JSON.stringify({
+          id: orderId,
+          status,
+          ...(status === 'rejected' ? { error: 'error' } : {}),
+        }),
       });
-      if (!res.ok) throw new Error('Status update failed');
-      toast.success(`Status updated to ${status}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (data.code === 'ALREADY_PROCESSED') {
+          toast('Order already processed', { id: toastId, ...toastWarningOptions });
+          return;
+        }
+        throw new Error(data.error || messages.error);
+      }
+      toast.success(messages.success, { id: toastId });
       await fetchNewOrders();
     } catch (e) {
-      toast.error('Failed to update status');
+      toast.error(e instanceof Error ? e.message : messages.error, { id: toastId });
     }
   }, [fetchNewOrders]);
+
+  const openOrderEditor = useCallback((order: NewOrder) => {
+    const lines = (order.order_lines || []).map((line) => ({
+      item: line.sku_name || line.description || '',
+      quantity: line.quantity != null ? String(line.quantity) : '',
+      uom: line.unit_of_measure || '',
+    }));
+    setEditingOrder({
+      id: order.id,
+      customer_whatsapp: order.customer_whatsapp,
+      order_lines: lines,
+    });
+  }, []);
+
+  const saveOrderEdit = useCallback(async (payload: {
+    id: string;
+    whatsapp_sender: string;
+    analyzed_items: { item: string; quantity: number | null; uom: string | null }[];
+  }) => {
+    setSavingEdit(true);
+    const toastId = toast.loading('Saving order…');
+    try {
+      const res = await fetch('/api/orders/edit', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        if (data.code === 'NOT_EDITABLE') {
+          toast('Only pending orders can be edited', { id: toastId, ...toastWarningOptions });
+          setEditingOrder(null);
+          return;
+        }
+        throw new Error(data.error || `Failed to save order (HTTP ${res.status})`);
+      }
+
+      // Update table immediately from verified API response (DB row).
+      if (data.data) {
+        setNewOrders((prev) =>
+          prev.map((o) => (o.id === payload.id ? mapSavedRowToOrder(o, data.data) : o))
+        );
+      }
+
+      toast.success('Order updated successfully', { id: toastId });
+      setEditingOrder(null);
+      router.refresh();
+      void fetchNewOrders({ silent: true });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to save order', { id: toastId });
+    } finally {
+      setSavingEdit(false);
+    }
+  }, [fetchNewOrders, router]);
 
   useEffect(() => {
     fetchNewOrders();
@@ -442,16 +572,17 @@ export default function OrdersPage() {
                 <th className="px-2 py-2 font-semibold align-bottom">Status</th>
                 <th className="px-2 py-2 font-semibold align-bottom">Approval</th>
                 <th className="px-2 py-2 font-semibold align-bottom">Export</th>
+                <th className="px-2 py-2 font-semibold align-bottom whitespace-nowrap">Actions</th>
                 <th className="px-2 py-2 font-semibold align-bottom whitespace-nowrap">Received</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100" style={{ fontSize: '12px' }}>
               {loading && newOrders.length === 0 ? (
-                <tr><td colSpan={14} className="px-2 py-12 text-center text-slate-500" style={{ fontSize: '11px' }}>
+                <tr><td colSpan={15} className="px-2 py-12 text-center text-slate-500" style={{ fontSize: '11px' }}>
                   <RefreshCw className="w-6 h-6 text-slate-300 mx-auto mb-2 animate-spin" /> Loading new orders...
                 </td></tr>
               ) : newOrders.length === 0 ? (
-                <tr><td colSpan={14} className="px-2 py-12 text-center text-slate-500" style={{ fontSize: '11px' }}>
+                <tr><td colSpan={15} className="px-2 py-12 text-center text-slate-500" style={{ fontSize: '11px' }}>
                   <Package className="w-8 h-8 text-slate-300 mx-auto mb-2" /> No new orders found
                 </td></tr>
               ) : paginatedNewOrders.map(o => {
@@ -464,7 +595,8 @@ export default function OrdersPage() {
                   ? `https://drive.google.com/thumbnail?id=${driveFileId}&sz=w64`
                   : null;
                 const driveFilename = o.documents?.original_filename || 'Open in Google Drive';
-                const ap = o.approval_status || 'draft';
+                const ap = o.approval_status || 'pending';
+                const orderType = o.order_type || (o.documents?.media_url ? 'image' : 'text');
                 // Sort line items by line_number for stable display.
                 const lines = (o.order_lines || [])
                   .slice()
@@ -516,11 +648,22 @@ export default function OrdersPage() {
                         </a>
                       ) : (
                         <div className="flex flex-col gap-1 items-start">
-                          <div className="flex items-center gap-1">
+                          <div className="flex items-center gap-1 flex-wrap">
                             <Icon className="w-3 h-3 text-slate-400" />
                             <span className="text-slate-600">{SOURCE_LABELS[src] || src}</span>
+                            <span className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                              orderType === 'image'
+                                ? 'bg-violet-50 text-violet-700'
+                                : 'bg-sky-50 text-sky-700'
+                            }`}>
+                              {orderType === 'image' ? (
+                                <><Image className="w-2.5 h-2.5" /> Image</>
+                              ) : (
+                                <><FileText className="w-2.5 h-2.5" /> Text</>
+                              )}
+                            </span>
                           </div>
-                          {o.documents?.media_url && (
+                          {orderType === 'image' && o.documents?.media_url && (
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -635,8 +778,7 @@ export default function OrdersPage() {
                     <td className="px-2 py-2 align-top">
                       <div className="flex flex-col items-start gap-1 w-fit">
                         {[
-                          { value: 'draft', label: 'draft', activeClass: 'bg-slate-100 text-slate-700 px-2.5 py-1 rounded-full', inactiveClass: 'text-slate-700 hover:opacity-80 px-1 py-1' },
-                          { value: 'under_review', label: 'Review', activeClass: 'bg-blue-100 text-blue-700 px-2.5 py-1 rounded-full', inactiveClass: 'text-blue-600 hover:opacity-80 px-1 py-1' },
+                          { value: 'pending', label: 'Pending', activeClass: 'bg-slate-100 text-slate-700 px-2.5 py-1 rounded-full', inactiveClass: 'text-slate-700 hover:opacity-80 px-1 py-1' },
                           { value: 'approved', label: 'Approve', activeClass: 'bg-emerald-100 text-emerald-800 px-2.5 py-1 rounded-full', inactiveClass: 'text-teal-600 hover:opacity-80 px-1 py-1' },
                           { value: 'rejected', label: 'Reject', activeClass: 'bg-red-100 text-red-700 px-2.5 py-1 rounded-full', inactiveClass: 'text-red-700 hover:opacity-80 px-1 py-1' }
                         ].map(opt => {
@@ -676,6 +818,20 @@ export default function OrdersPage() {
                     <td className="px-2 py-2 align-top">
                       <Badge className={getStatusColor(o.export_status || 'pending') + ' !text-[12px] !px-1.5 !py-0.5'}>{o.export_status || 'pending'}</Badge>
                     </td>
+
+                    {/* ACTIONS */}
+                    <td className="px-2 py-2 align-top">
+                      <button
+                        type="button"
+                        onClick={() => openOrderEditor(o)}
+                        disabled={ap !== 'pending'}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium text-slate-700 hover:bg-slate-100 border border-slate-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                        title={ap === 'pending' ? 'Edit order' : 'Only pending orders can be edited'}
+                      >
+                        <Pencil className="w-3 h-3" /> Edit
+                      </button>
+                    </td>
+
                     <td className="px-2 py-2 text-slate-500 align-top whitespace-nowrap">{formatDate(o.documents?.received_at)}</td>
                   </tr>
                 );
@@ -709,6 +865,15 @@ export default function OrdersPage() {
         )}
       </Card>
 
+      {editingOrder && (
+        <OrderEditModal
+          order={editingOrder}
+          saving={savingEdit}
+          onClose={() => !savingEdit && setEditingOrder(null)}
+          onSave={saveOrderEdit}
+        />
+      )}
+
       {/* Draggable Image Preview */}
       {previewImageUrl && (
         <DraggableImagePreview
@@ -720,6 +885,34 @@ export default function OrdersPage() {
   );
 }
 
+function MediaPreviewContent({
+  proxyUrl,
+  isLoading,
+  onLoad,
+}: {
+  proxyUrl: string;
+  isLoading: boolean;
+  onLoad: () => void;
+}) {
+  return (
+    <div className="flex-1 min-h-0 overflow-auto bg-slate-50/50 flex items-center justify-center relative p-2 sm:p-2">
+      {isLoading && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-50/80 z-10">
+          <RefreshCw className="w-6 h-6 text-brand-600 animate-spin mb-2" />
+          <span className="text-xs text-slate-500 font-medium tracking-wide">Fetching secure media...</span>
+        </div>
+      )}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={proxyUrl}
+        alt="WhatsApp media preview"
+        onLoad={onLoad}
+        className={`max-w-full max-h-full object-contain pointer-events-none rounded shadow-sm bg-white transition-opacity duration-300 ${isLoading ? 'opacity-0' : 'opacity-100'}`}
+      />
+    </div>
+  );
+}
+
 function DraggableImagePreview({ url, onClose }: { url: string; onClose: () => void }) {
   const [position, setPosition] = useState({ x: 100, y: 100 });
   const [isDragging, setIsDragging] = useState(false);
@@ -727,68 +920,106 @@ function DraggableImagePreview({ url, onClose }: { url: string; onClose: () => v
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    // Dock to the right side of the screen by default so it doesn't obscure the table
     setPosition({ x: Math.max(50, window.innerWidth - 450), y: 100 });
   }, []);
 
-  // Use the proxy route so secure Twilio domains bypass CORS and authentication issues
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = '';
+    };
+  }, [onClose]);
+
   const proxyUrl = `/api/twilio/media?url=${encodeURIComponent(url)}`;
 
   return (
-    <div
-      className="fixed z-[100] shadow-2xl rounded-xl bg-white border border-slate-300 flex flex-col"
-      style={{
-        left: position.x,
-        top: position.y,
-        width: '400px',
-        height: '500px',
-        resize: 'both',
-        overflow: 'hidden'
-      }}
-    >
-      {/* Draggable Header */}
+    <>
+      {/* Mobile: fullscreen modal with backdrop tap-to-close */}
+      <div className="sm:hidden fixed inset-0 z-[100] flex flex-col">
+        <button
+          type="button"
+          className="absolute inset-0 bg-black/60"
+          onClick={onClose}
+          aria-label="Close preview"
+        />
+        <div
+          className="relative z-10 mt-auto flex flex-col bg-white rounded-t-2xl shadow-2xl"
+          style={{ height: 'min(92dvh, 100%)' }}
+        >
+          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 bg-white rounded-t-2xl shrink-0">
+            <div className="flex items-center gap-2 font-medium text-slate-700 text-sm">
+              <span>🖼️</span> WhatsApp Media
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-slate-600 hover:text-slate-900 active:bg-slate-200 w-11 h-11 -mr-2 rounded-xl flex items-center justify-center transition-colors shrink-0 touch-manipulation"
+              aria-label="Close preview"
+            >
+              <X className="w-6 h-6" />
+            </button>
+          </div>
+          <MediaPreviewContent
+            proxyUrl={proxyUrl}
+            isLoading={isLoading}
+            onLoad={() => setIsLoading(false)}
+          />
+        </div>
+      </div>
+
+      {/* Desktop: draggable floating panel */}
       <div
-        className="bg-slate-100 px-3 py-2 flex items-center justify-between cursor-move border-b border-slate-200 select-none shadow-sm"
-        onPointerDown={(e) => {
-          setIsDragging(true);
-          setDragOffset({ x: e.clientX - position.x, y: e.clientY - position.y });
-          e.currentTarget.setPointerCapture(e.pointerId);
-        }}
-        onPointerMove={(e) => {
-          if (isDragging) {
-            setPosition({ x: e.clientX - dragOffset.x, y: e.clientY - dragOffset.y });
-          }
-        }}
-        onPointerUp={(e) => {
-          setIsDragging(false);
-          e.currentTarget.releasePointerCapture(e.pointerId);
+        className="hidden sm:flex fixed z-[100] shadow-2xl rounded-xl bg-white border border-slate-300 flex-col"
+        style={{
+          left: position.x,
+          top: position.y,
+          width: '400px',
+          height: '500px',
+          resize: 'both',
+          overflow: 'hidden',
         }}
       >
-        <div className="flex items-center gap-1.5 font-medium text-slate-700 text-sm">
-          <span>🖼️</span> WhatsApp Media
-        </div>
-        <button
-          onClick={onClose}
-          onPointerDown={(e) => e.stopPropagation()} // Prevent drag conflict that blocks clicks!
-          className="text-slate-400 hover:text-slate-700 hover:bg-slate-200 w-6 h-6 rounded-md flex items-center justify-center transition-colors shrink-0"
-        >✕</button>
-      </div>
-      {/* Scrollable/Resizable Image Area */}
-      <div className="flex-1 overflow-auto bg-slate-50/50 flex items-center justify-center relative p-2">
-        {isLoading && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-50/80 z-10">
-            <RefreshCw className="w-6 h-6 text-brand-600 animate-spin mb-2" />
-            <span className="text-xs text-slate-500 font-medium tracking-wide">Fetching secure media...</span>
+        <div
+          className="bg-slate-100 px-3 py-2 flex items-center justify-between cursor-move border-b border-slate-200 select-none shadow-sm"
+          onPointerDown={(e) => {
+            setIsDragging(true);
+            setDragOffset({ x: e.clientX - position.x, y: e.clientY - position.y });
+            e.currentTarget.setPointerCapture(e.pointerId);
+          }}
+          onPointerMove={(e) => {
+            if (isDragging) {
+              setPosition({ x: e.clientX - dragOffset.x, y: e.clientY - dragOffset.y });
+            }
+          }}
+          onPointerUp={(e) => {
+            setIsDragging(false);
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }}
+        >
+          <div className="flex items-center gap-1.5 font-medium text-slate-700 text-sm">
+            <span>🖼️</span> WhatsApp Media
           </div>
-        )}
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={proxyUrl}
-          alt="Preview"
+          <button
+            type="button"
+            onClick={onClose}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="text-slate-400 hover:text-slate-700 hover:bg-slate-200 w-8 h-8 rounded-md flex items-center justify-center transition-colors shrink-0"
+            aria-label="Close preview"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <MediaPreviewContent
+          proxyUrl={proxyUrl}
+          isLoading={isLoading}
           onLoad={() => setIsLoading(false)}
-          className={`max-w-full max-h-full object-contain pointer-events-none rounded shadow-sm bg-white transition-opacity duration-300 ${isLoading ? 'opacity-0' : 'opacity-100'}`}
         />
       </div>
-    </div>
+    </>
   );
 }
