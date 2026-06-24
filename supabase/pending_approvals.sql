@@ -1,5 +1,6 @@
 -- 1. Create an ENUM type to easily track order validation lifecycle
 CREATE TYPE approval_status AS ENUM ('pending', 'approved', 'rejected');
+CREATE TYPE order_type AS ENUM ('image', 'text');
 
 -- 2. Create the temporary approvals table
 CREATE TABLE public.pending_approvals (
@@ -8,6 +9,9 @@ CREATE TABLE public.pending_approvals (
     
     -- Tracks the exact n8n execution instance for audit safety
     n8n_execution_id VARCHAR(255) NOT NULL,
+
+    -- Callback URL for the n8n Wait node to resume the workflow after approval
+    n8n_wait_node_callbackurl TEXT,
     
     -- Metadata about the original communication
     whatsapp_sender VARCHAR(50) NOT NULL,
@@ -19,6 +23,7 @@ CREATE TABLE public.pending_approvals (
     
     -- Status flags
     status approval_status NOT NULL DEFAULT 'pending',
+    type order_type NOT NULL DEFAULT 'image',
     
     -- Timestamps
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
