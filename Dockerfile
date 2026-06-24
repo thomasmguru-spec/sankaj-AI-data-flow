@@ -9,7 +9,9 @@ RUN npm ci
 # Copy the rest of the application code
 COPY . .
 
-# Build the Next.js application
+# Build the Next.js application (BUILD_ID busts client caches on redeploy)
+ARG BUILD_ID=dev
+ENV BUILD_ID=$BUILD_ID
 RUN npm run build
 
 EXPOSE 3000
